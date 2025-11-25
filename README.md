@@ -1,3 +1,6 @@
 # Projeto_SO
 Projeto pertinente a matéria de sistemas operacionais
+
+---
+## Imagem da Arquitetura
 ![paraalelismo arquitetura](https://github.com/Gustavo-Gomide/Projeto_SO/blob/main/arquitetura%20paralelismo.png)

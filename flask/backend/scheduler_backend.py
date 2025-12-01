@@ -1,3 +1,36 @@
+"""
+=================================================================
+BSB COMPUTE — Backend do Orquestrador (Sockets + Threads + Métricas)
+=================================================================
+
+Visão geral
+-----------
+Núcleo do sistema distribuído: inicia N servidores TCP (processos),
+mantém pontes full-duplex com threads (sender/receiver), aplica políticas
+de escalonamento e coleta métricas de uso de CPU/memória e progresso.
+
+Destaques de arquitetura
+------------------------
+- Comunicação JSON sobre TCP com mensagens delimitadas por `\n`.
+- Servidores multi-thread: uma thread por tarefa para paralelismo real.
+- Alocação Quick Fit (Least Connections) com desempates determinísticos.
+- Orquestrador com estratégias SJF, Round Robin, Prioridade e FIFO.
+- Logger com broadcast SSE para UI (filas por assinante, não bloqueante).
+
+Protocolos e formatos
+---------------------
+- Socket request: dicionário com `id`, `tempo_exec`, `tempo_restante`, `prioridade`.
+- Socket response: `{tipo:"CONCLUSAO"|"PREEMPCAO", req_id, servidor_id, ...}`.
+- SSE: `data: {json}\n\n` com tipos `INICIO`, `ATRIBUICAO`, `PREEMPCAO`, `CONCLUSAO`, `FIM`.
+
+Concorrência & robustez
+-----------------------
+- Contadores de carga protegidos por `load_lock`.
+- Sender incrementa carga antes do envio; receiver decrementa ao receber.
+- Remoção automática de assinantes SSE em backpressure (`queue.Full`).
+- Shutdown gracioso: `STOP` nas filas, join de threads, terminate dos processos.
+"""
+
 import time
 import threading
 import queue
@@ -623,3 +656,68 @@ class TaskScheduler:
             active = sum(self.server_load.values())
         return len(self.lista_global) + active
 
+class SchedulerService:
+    """Fachada para controlar o Scheduler a partir do Flask.
+
+    Abstrai criação e ciclo de vida do `TaskScheduler`, expondo métodos
+    `start`, `stop`, `status`, `metrics`, `results` e `subscribe`.
+    """
+    def __init__(self):
+        self._sched = None
+        self._thread = None
+        self._event_queue = None
+        try:
+            multiprocessing.freeze_support()
+        except Exception:
+            pass
+
+    def start(self, tasks_path, strategy="ROUND_ROBIN", quantum=2):
+        if self._thread and self._thread.is_alive():
+            return False, "Já está em execução"
+        try:
+            logger = RealtimeLogger()
+            self._sched = TaskScheduler(tasks_path, strategy=strategy, quantum=quantum, logger=logger)
+            self._event_queue = logger.subscribe()
+            self._thread = threading.Thread(target=self._sched.run, daemon=True)
+            self._thread.start()
+            return True, "Execução iniciada"
+        except Exception as e:
+            return False, f"Falha ao iniciar: {e}"
+
+    def stop(self):
+        if not self._sched:
+            return False, "Não há execução ativa"
+        try:
+            self._sched.stop()
+            if self._thread:
+                self._thread.join(timeout=5)
+            return True, "Execução parada"
+        except Exception as e:
+            return False, f"Erro ao parar: {e}"
+
+    def subscribe(self):
+        if not self._sched:
+            return None
+        return self._sched.logger.subscribe()
+
+    def status(self):
+        running = bool(self._thread and self._thread.is_alive())
+        data = {"running": running, "hasScheduler": bool(self._sched is not None)}
+        if self._sched:
+            data.update({
+                "strategy": self._sched.strategy,
+                "quantum": self._sched.quantum,
+                "pendentes": self._sched.pendentes(),
+                "servers": self._sched.server_states(),
+            })
+        return data
+
+    def metrics(self):
+        if not self._sched:
+            return {}
+        return self._sched.summary()
+
+    def results(self):
+        if not self._sched:
+            return {"items": []}
+        return {"items": self._sched.dados_concluidos}

@@ -681,6 +681,10 @@ def run_socket_server(server_id, port, quantum):
     # Cleanup final: fecha socket de escuta ao sair do loop
     server_socket.close()
 
+# ============================================================================
+# 6. ESCALONADOR (CLIENTE)
+# ============================================================================
+
 class TaskScheduler:
     """Orquestrador central de tarefas com políticas de escalonamento distribuído.
 

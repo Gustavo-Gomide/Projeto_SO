@@ -1,8 +1,48 @@
+"""
+=================================================================
+BSB COMPUTE — Sistema Distribuído (Sockets TCP/IP)
+=================================================================
+
+Visão geral
+-----------
+Este módulo implementa um sistema distribuído simplificado com três
+componentes principais:
+
+- Servidores de execução: processos independentes (via `multiprocessing`)
+    que aceitam tarefas por TCP, processam em threads para paralelismo real
+    e retornam resultados ao orquestrador.
+- Orquestrador (cliente): coordena o envio das tarefas, recebe as
+    respostas, aplica políticas de escalonamento (SJF, Round Robin, Prioridade)
+    e faz o balanceamento com um alocador Quick Fit adaptado.
+- Logger: gera logs em tempo real e coleta métricas básicas de execução.
+
+Destaques de arquitetura
+------------------------
+- Comunicação full-duplex por sockets com protocolo simples baseado em
+    mensagens JSON terminadas por `\n`.
+- Paralelismo real nos servidores: cada tarefa recebida é processada em
+    uma thread independente, permitindo múltiplas tarefas simultâneas.
+- Controle de carga ativa: o orquestrador acompanha tarefas em execução
+    por servidor e usa essa informação para decidir a alocação.
+- Quick Fit (adaptado): seleciona o melhor servidor considerando menor
+    carga ativa, maior capacidade como desempate e ID como critério final.
+
+Estratégias suportadas
+----------------------
+- SJF: menor tempo de execução primeiro (sem quantum).
+- Round Robin: com quantum configurável.
+- Prioridade: ordena por prioridade (1=Alta, 2=Média, 3=Baixa).
+- FIFO: Round Robin com quantum zero (execução contínua).
+"""
+
 import json
-from pathlib import Path
-import threading
 import time
+import threading
+import multiprocessing
+import psutil
 import socket
+from pathlib import Path
+import queue
 
 # ============================================================================
 # 1. UTILITÁRIOS DE REDE
@@ -640,3 +680,731 @@ def run_socket_server(server_id, port, quantum):
             
     # Cleanup final: fecha socket de escuta ao sair do loop
     server_socket.close()
+
+class TaskScheduler:
+    """Orquestrador central de tarefas com políticas de escalonamento distribuído.
+
+    Coordena execução de tarefas em cluster de servidores TCP independentes,
+    implementando estratégias clássicas de escalonamento de processos adaptadas
+    para ambiente distribuído. Gerencia ciclo completo: carregamento, distribuição,
+    monitoramento e coleta de resultados.
+    
+    Responsabilidades:
+        - **Carregamento**: Lê configuração JSON com servidores e tarefas.
+        - **Distribuição**: Aloca tarefas usando Quick Fit (Least Connections).
+        - **Escalonamento**: Aplica SJF, Round Robin, Prioridade ou FIFO.
+        - **Comunicação**: Mantém pontes full-duplex via sockets TCP.
+        - **Monitoramento**: Rastreia carga ativa, tarefas concluídas, métricas.
+        - **Relatório**: Calcula estatísticas de utilização e desempenho.
+        
+    Estratégias Suportadas:
+        - **SJF**: Shortest Job First (quantum=0, não-preemptivo).
+        - **ROUND_ROBIN**: Quantum fixo com preempção cíclica.
+        - **PRIORIDADE**: Ordena por prioridade numérica (1=alta, 3=baixa).
+        - **FIFO**: First In First Out, ordem de chegada.
+        
+    Arquitetura:
+        - 1 processo orquestrador (este) + N processos servidores.
+        - 1 thread de ponte (socket_bridge) por servidor.
+        - 1 thread de monitoramento (metrics) compartilhada.
+        - Comunicação via JSON sobre TCP com protocolo de mensagens.
+    """
+
+    def __init__(self, json_path, strategy="ROUND_ROBIN", quantum=2):
+        """Inicializa orquestrador com configuração e estruturas de dados.
+        
+        Args:
+            json_path (str|Path): Caminho para JSON com 'servidores' e 'requisicoes'.
+            strategy (str): Estratégia de escalonamento. Valores aceitos:
+                           "SJF", "ROUND_ROBIN", "PRIORIDADE", "FIFO".
+            quantum (float): Fatia de tempo para Round Robin (em segundos).
+                            Ignorado para SJF (sempre 0).
+                            
+        Attributes:
+            json_path (str): Caminho do arquivo de configuração.
+            strategy (str): Estratégia normalizada (uppercase).
+            quantum (float): Quantum efetivo (0 para SJF).
+            logger (RealtimeLogger): Sistema de logging thread-safe.
+            servidores (list[dict]): Configuração dos servidores carregada.
+            requisicoes (list[dict]): Lista de tarefas a processar.
+            task_queues (dict): Mapa {server_id: Queue} com filas locais.
+            lista_global_pendentes (list): Tarefas ainda não alocadas.
+            server_load (dict): Mapa {server_id: int} com contadores de carga.
+            load_lock (Lock): Proteção para server_load (modificações concorrentes).
+            concluidas (set): IDs de tarefas já finalizadas.
+            dados_concluidos (list): Metadados completos de tarefas concluídas.
+            total_reqs (int): Número total de tarefas (para calcular progresso).
+            quick_fit (QuickFitAllocator): Alocador de carga Least Connections.
+            running (bool): Flag de controle para loops de orquestração.
+            
+        Note:
+            - Quantum é forçado a 0 para SJF (semântica não-preemptiva).
+            - task_queues criadas dinamicamente para N servidores.
+            - lista_global_pendentes é cópia (modificações não afetam original).
+        """
+        # Configuração básica
+        self.json_path = json_path
+        self.strategy = strategy.upper()  # Normaliza para comparações
+        
+        # Quantum: 0 para SJF (não-preemptivo), valor fornecido para outros
+        self.quantum = quantum if strategy != "SJF" else 0
+        
+        # Sistema de logging thread-safe
+        self.logger = RealtimeLogger()
+        
+        # Carrega servidores e requisições do JSON
+        self._load_config()
+
+        # Estruturas de distribuição: uma fila por servidor
+        # Filas são thread-safe nativamente (queue.Queue)
+        self.task_queues = {srv["id"]: queue.Queue() for srv in self.servidores}
+        
+        # Lista global: tarefas ainda não alocadas a nenhum servidor
+        # Cópia independente permite manipulação destrutiva
+        self.lista_global_pendentes = list(self.requisicoes)
+        
+        # RASTREAMENTO DE CARGA ATIVA
+        # server_load: contador de tarefas em execução (não apenas na fila)
+        self.server_load = {srv["id"]: 0 for srv in self.servidores}
+        # load_lock: protege server_load contra condições de corrida
+        self.load_lock = threading.Lock()
+
+        # Rastreamento de conclusão
+        self.concluidas = set()           # IDs para lookup rápido (O(1))
+        self.dados_concluidos = []        # Dados completos para relatório
+        self.total_reqs = len(self.requisicoes)  # Total para calcular progresso
+        
+        # Alocador de servidores (Least Connections)
+        self.quick_fit = QuickFitAllocator(self.servidores)
+        
+        # Flag de controle do loop de orquestração
+        self.running = True
+
+    def _load_config(self):
+        """Carrega e pré-processa configuração do arquivo JSON.
+        
+        Lê estrutura JSON esperada com chaves 'servidores' e 'requisicoes',
+        validando implicitamente formato e inicializando campos derivados.
+        
+        Side Effects:
+            - Define self.servidores: Lista de dicts com {id, capacidade, ...}.
+            - Define self.requisicoes: Lista de dicts com {id, tipo, tempo_exec, ...}.
+            - Adiciona campo 'tempo_restante' a cada requisição (inicialmente = tempo_exec).
+            
+        Raises:
+            FileNotFoundError: Se json_path não existir.
+            json.JSONDecodeError: Se arquivo não for JSON válido.
+            KeyError: Se estrutura JSON faltar chaves 'servidores' ou 'requisicoes'.
+            
+        Note:
+            - 'tempo_restante' permite rastrear progressão de tarefas preemptivas.
+            - Modificação in-place das requisições é segura (lista será copiada).
+        """
+        with open(self.json_path, "r", encoding="utf-8") as f:
+            # Parse JSON completo
+            d = json.load(f)
+            
+            # Extrai seções de configuração (lança KeyError se ausentes)
+            self.servidores = d["servidores"]
+            self.requisicoes = d["requisicoes"]
+            
+            # Pré-processamento: inicializa tempo restante
+            # Cada requisição começa com tempo_restante = tempo_exec
+            for r in self.requisicoes:
+                r['tempo_restante'] = r['tempo_exec']
+
+    def _priority_name(self, p):
+        """Converte nível numérico de prioridade em label humanizado.
+        
+        Args:
+            p (int): Prioridade numérica (1, 2 ou 3).
+            
+        Returns:
+            str: "Alta" (p=1), "Média" (p=2) ou "Baixa" (outros).
+            
+        Note:
+            - Usado apenas para logging/UI, não afeta lógica de escalonamento.
+            - Padrão "Baixa" para valores inesperados (defensive programming).
+        """
+        return "Alta" if p == 1 else "Média" if p == 2 else "Baixa"
+
+    # --- PONTE FULL-DUPLEX ---
+    def socket_bridge(self, server_id, port):
+        """Estabelece canal de comunicação bidirecional com servidor via TCP.
+
+        Implementa padrão full-duplex: thread separada para envio (sender) +
+        loop principal para recepção (receiver). Gerencia contabilidade de
+        carga ativa e sincronização de estado entre orquestrador e servidor.
+        
+        Args:
+            server_id (int): Identificador do servidor alvo.
+            port (int): Porta TCP onde servidor está escutando.
+            
+        Lifecycle:
+            1. Tenta conectar ao servidor (até 10 tentativas com retry).
+            2. Spawna thread sender para enviar tarefas da fila.
+            3. Loop principal receiver processa respostas (CONCLUSAO/PREEMPCAO).
+            4. Ao encerrar, envia comando STOP e fecha socket.
+            
+        Concurrency:
+            - Sender: Thread dedicada lê task_queues[server_id] e envia JSONs.
+            - Receiver: Loop principal (esta thread) lê respostas e atualiza estado.
+            - load_lock: Protege server_load contra condições de corrida.
+            
+        State Management:
+            - Incrementa server_load ANTES de enviar tarefa (antecipa carga).
+            - Decrementa server_load AO RECEBER resposta (libera slot).
+            - CONCLUSAO: Move tarefa para concluidas, registra metrics.
+            - PREEMPCAO: Retorna tarefa para lista_global_pendentes com tempo atualizado.
+            
+        Error Handling:
+            - Retry com backoff exponencial (10 tentativas x 0.5s).
+            - Falha de conexão: loga erro e retorna (servidor indisponível).
+            - Erros de comunicação: encerra ponte graciosamente.
+            
+        Note:
+            - Roda em thread separada (uma por servidor).
+            - Conexão permanente durante toda a sessão (não reconecta).
+        """
+        # Cria socket TCP cliente
+        client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        
+        # Retry loop: aguarda servidor inicializar (pode demorar alguns ms)
+        connected = False
+        for tentativa in range(10):
+            try:
+                client_socket.connect(('localhost', port))
+                connected = True
+                break
+            except:
+                # Servidor ainda não pronto, aguarda antes de retry
+                time.sleep(0.5)
+        
+        # Se todas as tentativas falharam, aborta ponte
+        if not connected:
+            print(f"❌ Falha ao conectar com Servidor {server_id} na porta {port}")
+            return
+
+        # ====================================================================
+        # SENDER THREAD: Envia tarefas da fila para o servidor
+        # ====================================================================
+        def sender_loop():
+            """Thread emissora: drena fila do servidor e envia tarefas via socket.
+            
+            Responsabilidades:
+                - Bloqueia aguardando tarefas na task_queues[server_id].
+                - Envia JSON via socket para servidor processar.
+                - Incrementa server_load ANTES de enviar (reserva slot).
+                - Trata comando especial "STOP" para encerramento gracioso.
+                
+            Termination:
+                - self.running=False: Encerra após timeout.
+                - Comando "STOP": Envia para servidor e encerra.
+                - Erro de socket: Encerra silenciosamente.
+            """
+            while self.running:
+                try:
+                    # Aguarda próxima tarefa com timeout (permite checagem de self.running)
+                    task = self.task_queues[server_id].get(timeout=0.5)
+                    
+                    # Comando especial de encerramento
+                    if task == "STOP":
+                        try:
+                            send_json(client_socket, "STOP")
+                        except:
+                            pass  # Servidor já pode ter fechado
+                        break
+                    
+                    # CONTABILIDADE DE CARGA: Incrementa ANTES de enviar
+                    # Garante que Quick Fit veja carga atualizada imediatamente
+                    with self.load_lock:
+                        self.server_load[server_id] += 1
+                    
+                    # Envia tarefa via socket (JSON serializado + '\n')
+                    send_json(client_socket, task)
+                    
+                except queue.Empty:
+                    # Timeout normal: verifica self.running e continua
+                    continue
+                except:
+                    # Erro crítico (ex: socket fechado): encerra thread
+                    break
+
+        # Spawna thread sender (daemon=False para aguardar no join)
+        t_sender = threading.Thread(target=sender_loop, daemon=False)
+        t_sender.start()
+
+        # ====================================================================
+        # RECEIVER LOOP: Processa respostas do servidor (loop principal)
+        # ====================================================================
+        while self.running:
+            try:
+                # Lê próxima resposta do servidor (bloqueia até receber)
+                resposta = recv_json(client_socket)
+                
+                # Conexão fechada ou erro de leitura: encerra ponte
+                if not resposta:
+                    break
+
+                # CONTABILIDADE DE CARGA: Decrementa AO RECEBER resposta
+                # Libera slot para próxima tarefa (servidor ficou disponível)
+                with self.load_lock:
+                    self.server_load[server_id] -= 1
+
+                # ============================================================
+                # Tipo: CONCLUSAO - Tarefa finalizada com sucesso
+                # ============================================================
+                if resposta['tipo'] == 'CONCLUSAO':
+                    # Loga evento de conclusão
+                    self.logger.log("CONCLUSAO", 
+                                   req_id=resposta['req_id'], 
+                                   servidor_id=server_id)
+                    
+                    # Atualiza estruturas de controle de forma atômica
+                    with self.logger.lock:
+                        self.concluidas.add(resposta['req_id'])          # Marca como concluída
+                        self.dados_concluidos.append(resposta)           # Armazena metadados
+                        self.logger.metrics["requisicoes_completas"] += 1  # Incrementa métrica
+                
+                # ============================================================
+                # Tipo: PREEMPCAO - Quantum esgotado, tarefa retorna à fila
+                # ============================================================
+                elif resposta['tipo'] == 'PREEMPCAO':
+                    # Loga evento de preempção com tempo restante
+                    self.logger.log("PREEMPCAO", 
+                                   req_id=resposta['req_id'], 
+                                   servidor_id=server_id, 
+                                   detalhes=resposta['tempo_restante'])
+                    
+                    # Incrementa contador de preempções
+                    self.logger.add_metric("preempcoes", 1)
+                    
+                    # Recupera estado atualizado da tarefa (com tempo_restante reduzido)
+                    req_atualizada = resposta['dados_originais']
+                    req_atualizada['tempo_restante'] = resposta['tempo_restante']
+                    
+                    # Retorna tarefa para fila global (será reescalonada)
+                    self.lista_global_pendentes.append(req_atualizada)
+
+            except:
+                # Erro de comunicação: encerra ponte
+                break
+        
+        # Cleanup: aguarda thread sender terminar e fecha socket
+        t_sender.join()
+        client_socket.close()
+
+    # --- ORQUESTRADOR ---
+    def orchestrator_loop(self):
+        """Loop central de escalonamento e distribuição de tarefas.
+
+        Implementa ciclo contínuo de:
+        1. Ordenação: Aplica estratégia de escalonamento à fila global.
+        2. Seleção: Consulta Quick Fit para escolher servidor ideal.
+        3. Alocação: Enfileira tarefa na fila do servidor escolhido.
+        4. Verificação: Checa condições de término.
+        
+        Estratégias de Ordenação:
+            - PRIORIDADE: Sort por (prioridade, id) crescente.
+            - SJF: Sort por tempo_exec crescente (shortest first).
+            - ROUND_ROBIN/FIFO: Ordem de inserção preservada (FIFO implícito).
+            
+        Termination Conditions:
+            - Lista global vazia E todas as tarefas concluídas E carga zerada.
+            - self.running=False (sinalizado externamente).
+            
+        Concurrency:
+            - load_lock: Protege leitura de server_load (snapshot consistente).
+            - task_queues são thread-safe nativamente (queue.Queue).
+            
+        Note:
+            - Polling com sleep(0.01) para balancear responsividade vs CPU.
+            - Rollback automático (insert(0)) se alocação falhar.
+        """
+        # Loga início da orquestração
+        self.logger.log("INFO", detalhes=f"Orquestrador (TCP) iniciado. Estratégia: {self.strategy}")
+        
+        # Loop principal: executa até self.running=False
+        while self.running:
+            # ================================================================
+            # VERIFICAÇÃO DE TÉRMINO
+            # ================================================================
+            # Condição 1: Lista global vazia (nada mais a escalonar)
+            # Condição 2: Todas as tarefas marcadas como concluídas
+            if not self.lista_global_pendentes and len(self.concluidas) == self.total_reqs:
+                # Condição 3: Carga ativa zerada (ninguém trabalhando)
+                with self.load_lock:
+                    active = sum(self.server_load.values())
+                if active == 0:
+                    # Todas as condições satisfeitas: sistema ocioso
+                    time.sleep(0.5)
+                    continue
+
+            # Se lista global vazia mas ainda há tarefas em execução, aguarda
+            if not self.lista_global_pendentes:
+                time.sleep(0.1)
+                continue
+
+            # ================================================================
+            # FASE 1: ORDENAÇÃO (Aplicar estratégia de escalonamento)
+            # ================================================================
+            if self.strategy == "PRIORIDADE":
+                # Ordena por prioridade (1=alta, 3=baixa), desempate por ID
+                self.lista_global_pendentes.sort(key=lambda x: (x['prioridade'], x['id']))
+            elif self.strategy == "SJF":
+                # Shortest Job First: ordena por tempo de execução
+                self.lista_global_pendentes.sort(key=lambda x: x['tempo_exec'])
+            # ROUND_ROBIN/FIFO: não reordena (mantém ordem FIFO natural)
+            
+            
+            # ================================================================
+            # FASE 2: ALOCAÇÃO (Quick Fit + Distribuição)
+            # ================================================================
+            # Obtém snapshot thread-safe da carga atual
+            with self.load_lock:
+                current_load = self.server_load.copy()
+            
+            # Calcula estado atualizado de todos os servidores
+            estado = self.quick_fit.calcular_estado_servidores(self.task_queues, current_load)
+            
+            # Candidata: primeira tarefa após ordenação (maior prioridade)
+            req_candidata = self.lista_global_pendentes[0]
+            
+            # Aplica heurística Least Connections para escolher servidor
+            melhor_srv = self.quick_fit.encontrar_melhor_servidor(req_candidata, estado)
+
+            # ============================================================
+            # Caso 1: Servidor disponível encontrado
+            # ============================================================
+            if melhor_srv is not None:
+                # Remove tarefa da lista global (commit da alocação)
+                req_a_enviar = self.lista_global_pendentes.pop(0)
+                
+                try:
+                    # Enfileira tarefa na fila do servidor escolhido
+                    # Thread sender da ponte consumirá e enviará via socket
+                    self.task_queues[melhor_srv].put(req_a_enviar)
+                    
+                    # Prepara informações para logging
+                    prio_lbl = self._priority_name(req_a_enviar.get('prioridade', 0))
+                    load_real = current_load.get(melhor_srv, 0)
+                    cap_real = estado[melhor_srv]['capacidade']
+                    
+                    # Loga evento de atribuição com métricas de carga
+                    self.logger.log(
+                        "ATRIBUICAO",
+                        req_id=req_a_enviar['id'],
+                        servidor_id=melhor_srv,
+                        prioridade=prio_lbl,
+                        detalhes=f"Carga: {load_real}/{cap_real}"
+                    )
+                    
+                except:
+                    # Falha ao enfileirar: rollback (retorna tarefa ao início)
+                    # Condição rara (fila não deve falhar), mas garante consistência
+                    self.lista_global_pendentes.insert(0, req_a_enviar)
+            
+            # ============================================================
+            # Caso 2: Nenhum servidor disponível (todos saturados)
+            # ============================================================
+            else:
+                # Aguarda antes de tentar novamente (backpressure)
+                time.sleep(0.1)
+            
+            # Pequeno delay para evitar busy-waiting (economiza CPU)
+            time.sleep(0.01)
+
+    def monitor_loop(self):
+        """Thread de monitoramento contínuo de recursos do sistema.
+        
+        Coleta métricas de CPU em intervalos regulares para análise de
+        desempenho. Roda como daemon thread (encerra com processo principal).
+        
+        Behavior:
+            - Amostra CPU a cada 1 segundo (psutil.cpu_percent).
+            - Armazena valores em logger.metrics["cpu_valores"] (lista).
+            - Loop termina quando self.running=False.
+            
+        Note:
+            - interval=1 no cpu_percent causa sleep de 1s entre amostras.
+            - Métricas agregadas (média, pico) calculadas em exibir_relatorio.
+        """
+        while self.running:
+            # Obtém percentual de uso de CPU (média de 1s)
+            cpu = psutil.cpu_percent(interval=1)
+            # Adiciona à lista de valores (thread-safe via lock interno)
+            self.logger.add_metric("cpu_valores", cpu)
+
+    def exibir_relatorio(self, tempo_total):
+        """Gera e imprime relatório estatístico de desempenho do sistema.
+        
+        Calcula métricas agregadas sobre execução completa e apresenta
+        resumo formatado com estatísticas principais.
+        
+        Args:
+            tempo_total (float): Duração total da execução em segundos.
+            
+        Métricas Calculadas:
+            - Tarefas concluídas vs total.
+            - Tempo total de execução.
+            - Tempo médio de resposta (from submit to complete).
+            - Total de preempções (Round Robin).
+            - Throughput (tarefas/segundo).
+            
+        Note:
+            - Filtra dados_concluidos para garantir apenas dicts válidos.
+            - Tempo de resposta: delta entre tempo_final e start_time.
+            - Tratamento especial para caso de nenhuma tarefa concluída.
+        """
+        # Cabeçalho do relatório
+        print("\n" + "="*55)
+        print("📊 RESUMO FINAL (MODO SOCKETS TCP/IP)")
+        print("="*55)
+        
+        # Sanitização: filtra apenas dicts válidos (ignora possíveis None/erros)
+        dados_validos = [r for r in self.dados_concluidos if isinstance(r, dict)]
+        total = len(dados_validos)
+        
+        # Caso especial: nenhuma tarefa foi concluída
+        if total == 0:
+            print("Nenhuma tarefa concluída.")
+            return
+
+        # Calcula tempos de resposta individuais
+        tempos_resp = []
+        for r in dados_validos:
+            # Tempo de resposta = timestamp de conclusão - início do sistema
+            t_final = r.get('tempo_final', time.time())
+            tempos_resp.append(t_final - self.logger.start_time)
+
+        # Métricas agregadas
+        media_resp = sum(tempos_resp)/total if total > 0 else 0
+        preempcoes = self.logger.metrics["preempcoes"]
+        
+        # Impressão formatada
+        print(f"✅ Requisições: {total}/{self.total_reqs}")
+        print(f"⏱️  Tempo Total: {tempo_total:.2f}s")
+        print(f"📈 Tempo Médio de Resposta: {media_resp:.2f}s")
+        print(f"⏸️  Total de Preempções: {preempcoes}")
+        if tempo_total > 0:
+            # Throughput: tarefas concluídas por segundo
+            print(f"🚀 Throughput: {total/tempo_total:.2f} req/s")
+        print("\n" + "="*55 + "\n")
+
+    def run(self):
+        """Orquestra ciclo de vida completo do sistema distribuído.
+        
+        Sequencia de inicialização:
+        1. Spawna processos servidores TCP independentes.
+        2. Aguarda inicialização (bind/listen de sockets).
+        3. Cria threads de ponte (uma por servidor).
+        4. Inicia threads de orquestração e monitoramento.
+        5. Aguarda conclusão de todas as tarefas.
+        6. Shutdown gracioso: sinaliza threads, aguarda joins, termina processos.
+        7. Exibe relatório final de desempenho.
+        
+        Arquitetura de Concorrência:
+            - N processos: Servidores TCP (multiprocessing).
+            - N threads: Pontes full-duplex (uma por servidor).
+            - 1 thread: Orquestrador (escalonamento + alocação).
+            - 1 thread: Monitor de recursos (daemon).
+            - Main thread: Aguarda conclusão e coordena shutdown.
+            
+        Shutdown Gracioso:
+            - Seta self.running=False (threads checam periodicamente).
+            - Envia "STOP" para todas as filas (threads sender encerram).
+            - Join em bridge_threads e t_orq (aguarda conclusão limpa).
+            - Terminate em server_processes (força encerramento).
+            
+        Error Recovery:
+            - KeyboardInterrupt: Captura Ctrl+C e encerra graciosamente.
+            - Verificação de health: Alerta se todos os servidores caírem.
+            
+        Note:
+            - Sleep inicial de 2s garante servidores prontos antes de conexões.
+            - Daemon thread (monitor) encerra automaticamente com main.
+        """
+        # Banner de inicialização
+        print(f"\n🚀 INICIANDO SISTEMA DISTRIBUÍDO: {self.strategy}")
+        
+        # ====================================================================
+        # FASE 1: SPAWNAR PROCESSOS SERVIDORES
+        # ====================================================================
+        server_processes = []
+        for srv in self.servidores:
+            sid = srv['id']
+            # Calcula porta dinamicamente (5000 + ID)
+            port = get_port_for_server(sid)
+            
+            # Cria processo servidor independente
+            p = multiprocessing.Process(
+                target=run_socket_server,
+                args=(sid, port, self.quantum),
+                daemon=False  # Permite join explícito
+            )
+            p.start()
+            server_processes.append(p)
+        
+        # Aguarda servidores iniciarem (bind + listen)
+        print("⏳ Aguardando servidores iniciarem...")
+        time.sleep(2)
+
+        # Marca início da contagem de tempo
+        self.logger.start_time = time.time()
+        self.logger.log("INICIO")
+
+        # ====================================================================
+        # FASE 2: CRIAR THREADS DE PONTE (Full-Duplex)
+        # ====================================================================
+        bridge_threads = []
+        for srv in self.servidores:
+            sid = srv['id']
+            port = get_port_for_server(sid)
+            
+            # Cria thread de ponte bidirecional (sender + receiver)
+            t = threading.Thread(
+                target=self.socket_bridge,
+                args=(sid, port),
+                daemon=False  # Aguardamos join explícito
+            )
+            t.start()
+            bridge_threads.append(t)
+
+        # ====================================================================
+        # FASE 3: INICIAR ORQUESTRADOR E MONITOR
+        # ====================================================================
+        # Thread de orquestração (escalonamento + distribuição)
+        t_orq = threading.Thread(target=self.orchestrator_loop, daemon=False)
+        t_orq.start()
+        
+        # Thread de monitoramento (métricas de CPU) - daemon encerra com main
+        t_mon = threading.Thread(target=self.monitor_loop, daemon=True)
+        t_mon.start()
+
+        # ====================================================================
+        # FASE 4: AGUARDAR CONCLUSÃO DE TODAS AS TAREFAS
+        # ====================================================================
+        try:
+            # Loop de espera: verifica conclusão a cada 0.5s
+            while len(self.concluidas) < self.total_reqs:
+                time.sleep(0.5)
+                
+                # Health check: verifica se servidores ainda estão ativos
+                if not any(p.is_alive() for p in server_processes):
+                    print("⚠️  CRÍTICO: Todos os servidores caíram!")
+                    break
+                    
+        except KeyboardInterrupt:
+            # Usuário interrompeu com Ctrl+C
+            print("\nInterrupção do usuário. Encerrando graciosamente...")
+
+        # ====================================================================
+        # FASE 5: SHUTDOWN GRACIOSO
+        # ====================================================================
+        # Sinaliza threads para encerrar
+        self.running = False
+        
+        # Calcula tempo total de execução
+        tempo_total = time.time() - self.logger.start_time
+
+        # Envia comando STOP para todas as filas (threads sender consumirão)
+        for q in self.task_queues.values():
+            q.put("STOP")
+        
+        # Aguarda threads de ponte encerrarem (enviam STOP aos servidores)
+        for t in bridge_threads:
+            t.join(timeout=5)  # Timeout 5s para evitar deadlock
+        
+        # Aguarda thread de orquestração encerrar
+        t_orq.join(timeout=5)
+        
+        # Força encerramento de processos servidores (SIGTERM)
+        for p in server_processes:
+            p.terminate()
+            p.join(timeout=2)  # Aguarda até 2s por processo
+
+        # ====================================================================
+        # FASE 6: RELATÓRIO FINAL
+        # ====================================================================
+        self.logger.log("FIM")
+        self.exibir_relatorio(tempo_total)
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+def main():
+    """Entry point principal: Interface CLI para seleção de estratégia.
+    
+    Apresenta menu interativo permitindo escolha entre 4 estratégias de
+    escalonamento. Instancia TaskScheduler com configuração escolhida e
+    inicia execução do sistema distribuído.
+    
+    Opções de Estratégia:
+        1. SJF (Shortest Job First):
+           - Ordena por tempo_exec crescente.
+           - Quantum=0 (não-preemptivo, executa até o fim).
+           - Minimiza tempo médio de resposta para workloads heterogêneos.
+           
+        2. ROUND_ROBIN:
+           - Ordem FIFO com quantum=2s.
+           - Preemptivo: tarefas rotacionam a cada 2s.
+           - Garante fairness, evita starvação.
+           
+        3. PRIORIDADE:
+           - Ordena por prioridade (1=alta, 3=baixa) + ID.
+           - Quantum=2s (preemptivo dentro de mesma prioridade).
+           - Favorece tarefas críticas.
+           
+        4. FIFO (Round Robin sem Quantum):
+           - Ordem de chegada (First In First Out).
+           - Quantum=0 (não-preemptivo).
+           - Simplicidade máxima, sem overhead de preempção.
+           
+    Behavior:
+        - Input inválido: Defaults para ROUND_ROBIN (quantum=2).
+        - Leitura de tasks.json via constante TASKS_PATH.
+        - Execução bloqueante: aguarda conclusão de todas as tarefas.
+        
+    Note:
+        - multiprocessing.freeze_support() necessário para Windows (PyInstaller).
+        - Execução interativa, não retorna até conclusão ou Ctrl+C.
+    """
+    # Apresenta menu de opções
+    print("\n" + "="*50)
+    print("  SISTEMA DE ORQUESTRAÇÃO DISTRIBUÍDA VIA SOCKETS")
+    print("="*50)
+    print("Escolha a estratégia de escalonamento:")
+    print()
+    print("1. SJF (Shortest Job First) - Não-preemptivo")
+    print("2. ROUND_ROBIN - Quantum = 2s")
+    print("3. PRIORIDADE - Com quantum 2s")
+    print("4. FIFO - Ordem de chegada, não-preemptivo")
+    print("="*50)
+    
+    # Lê escolha do usuário
+    opt = input("Escolha (1-4): ").strip()
+    
+    # Mapa de configurações: opção -> (estratégia, quantum)
+    cfg = {
+        "1": ("SJF", 0),              # SJF: quantum 0 (não-preemptivo)
+        "2": ("ROUND_ROBIN", 2),      # RR: quantum 2s
+        "3": ("PRIORIDADE", 2),       # Prioridade: quantum 2s
+        "4": ("ROUND_ROBIN", 0)       # FIFO: RR com quantum 0 (equivalente)
+    }
+    
+    # Extrai configuração (default: RR com quantum 2s)
+    strat, quant = cfg.get(opt, ("ROUND_ROBIN", 2))
+
+    # Instancia orquestrador com configuração escolhida
+    app = TaskScheduler(TASKS_PATH, strategy=strat, quantum=quant)
+    
+    # Inicia execução (bloqueia até conclusão)
+    app.run()
+
+if __name__ == "__main__":
+    # Suporte para Windows (freeze para exe standalone via PyInstaller)
+    multiprocessing.freeze_support()
+    
+    # Executa interface CLI
+    main()

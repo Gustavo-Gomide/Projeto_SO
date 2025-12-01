@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 import threading
 import time
+import socket
 
 # ============================================================================
 # 1. UTILITÁRIOS DE REDE
@@ -407,3 +408,235 @@ class QuickFitAllocator:
             )
         )
         return melhor['id']
+
+# ============================================================================
+# 5. WORKER (SERVIDOR SOCKET MULTITHREAD)
+# ============================================================================
+
+def fake_inference_core(requisicao, quantum):
+    """Simula processamento de tarefa com consumo sintético de CPU.
+
+    Implementa loop de trabalho que respeita semântica de quantum para
+    escalonamento preemptivo. Combina sleep (I/O-bound) com cálculos
+    (CPU-bound) para simular carga realista.
+    
+    Args:
+        requisicao (dict): Metadados da tarefa contendo:
+            - 'tempo_restante' (float): Tempo ainda não processado.
+            - 'tempo_exec' (float): Tempo total original (fallback).
+        quantum (float): Limite de tempo para esta fatia de execução.
+                        Se 0, executa até completar (modo FIFO/SJF).
+                        
+    Returns:
+        tuple: (tempo_restante_novo, tempo_executado) onde:
+            - tempo_restante_novo (float): Saldo após esta execução.
+            - tempo_executado (float): Duração efetiva desta fatia.
+            
+    Behavior:
+        - Quantum 0: Executa tarefa completa (modo não-preemptivo).
+        - Quantum > 0: Limita execução a min(quantum, tempo_restante).
+        - Trabalho sintético: sleep + cálculos aritméticos (simula mix I/O+CPU).
+        
+    Note:
+        - Chunks de 0.1s balanceiam responsividade vs overhead de iteração.
+        - Cálculo de quadrados gera carga CPU mensurável para testes de desempenho.
+    """
+    # Obtém tempo pendente (prioriza 'tempo_restante' se disponível)
+    tempo_restante = requisicao.get("tempo_restante", requisicao.get("tempo_exec"))
+    
+    # Determina duração desta fatia de execução
+    if quantum == 0:
+        # Modo não-preemptivo: executa até o fim
+        tempo_execucao = tempo_restante
+    else:
+        # Modo preemptivo: respeita quantum ou termina se restar menos
+        tempo_execucao = min(quantum, tempo_restante)
+
+    # Marca início para medição precisa de tempo decorrido
+    start = time.time()
+    elapsed = 0
+    
+    # Loop de trabalho: simula processamento em chunks
+    while elapsed < tempo_execucao:
+        # Calcula duração do próximo chunk (máximo 0.1s)
+        chunk = min(0.1, tempo_execucao - elapsed)
+        
+        # Simula I/O-bound: espera passiva (libera CPU)
+        time.sleep(chunk)
+        
+        # Simula CPU-bound: cálculo sintético (consome ciclos)
+        # Sum de quadrados gera carga mensurável sem otimização do interpretador
+        _ = sum(i * i for i in range(1000))
+        
+        # Atualiza tempo decorrido (medição real, não sleep nominal)
+        elapsed = time.time() - start
+
+    # Calcula saldo restante (garante não-negativo por arredondamento)
+    novo_tempo_restante = max(0, tempo_restante - tempo_execucao)
+    return novo_tempo_restante, tempo_execucao
+
+def process_task_thread(conn, lock, requisicao, quantum, server_id):
+    """Worker thread que processa uma tarefa e envia resposta ao orquestrador.
+
+    Cada tarefa recebida pelo servidor é executada em uma thread independente,
+    permitindo paralelismo real (múltiplas tarefas simultâneas por servidor).
+    Após processamento, envia resposta via socket com resultado (CONCLUSAO
+    ou PREEMPCAO).
+    
+    Args:
+        conn (socket.socket): Conexão TCP estabelecida com o orquestrador.
+        lock (threading.Lock): Lock para serializar envios no socket compartilhado.
+        requisicao (dict): Metadados da tarefa a processar.
+        quantum (float): Limite de tempo por fatia (0 = sem limite).
+        server_id (int): ID deste servidor (para logging/depuração).
+        
+    Side Effects:
+        - Modifica `requisicao['tempo_restante']` in-place.
+        - Envia JSON via socket (CONCLUSAO ou PREEMPCAO).
+        
+    Thread Safety:
+        - Lock protege send_json() contra intercalação de mensagens.
+        - `requisicao` é cópia independente (não compartilhada entre threads).
+        
+    Protocol:
+        Envia um dos dois tipos de resposta:
+        - CONCLUSAO: Tarefa finalizada (tempo_restante ≤ 0.05s).
+        - PREEMPCAO: Quantum esgotado, tarefa deve retornar à fila.
+    """
+    # Extrai identificador para rastreabilidade
+    req_id = requisicao.get("id")
+    
+    # Executa fatia de trabalho (respeita quantum)
+    novo_restante, executado = fake_inference_core(requisicao, quantum)
+    
+    # Atualiza estado da requisição in-place (arredonda para evitar drift)
+    requisicao['tempo_restante'] = round(novo_restante, 2)
+
+    # Decide tipo de resposta baseado em critério de conclusão
+    # Threshold de 0.05s tolera imprecisões de ponto flutuante
+    if novo_restante <= 0.05:
+        # Tarefa completa: envia resultado final
+        resposta = {
+            "tipo": "CONCLUSAO",
+            "req_id": req_id,
+            "servidor_id": server_id,
+            "tempo_final": time.time(),       # Timestamp para métricas
+            "dados_originais": requisicao      # Estado final para auditoria
+        }
+    else:
+        # Quantum esgotado: sinaliza preempção
+        resposta = {
+            "tipo": "PREEMPCAO",
+            "req_id": req_id,
+            "servidor_id": server_id,
+            "tempo_restante": novo_restante,  # Saldo para próxima fatia
+            "dados_originais": requisicao      # Estado parcial preservado
+        }
+
+    # Envia resposta com proteção contra intercalação
+    # Lock necessário pois múltiplas threads compartilham mesmo socket
+    with lock:
+        try:
+            send_json(conn, resposta)
+        except:
+            # Falhas de envio (ex: conexão fechada) são ignoradas
+            # Servidor não tem como reprocessar, responsabilidade do orquestrador
+            pass
+
+def run_socket_server(server_id, port, quantum):
+    """Processo servidor independente que gerencia execução paralela de tarefas.
+
+    Implementa servidor TCP multi-threaded que:
+    1. Aceita conexões do orquestrador (permanentes durante sessão)
+    2. Recebe tarefas via mensagens JSON delimitadas por '\n'
+    3. Processa tarefas em threads paralelas (até capacidade do servidor)
+    4. Envia respostas (CONCLUSAO/PREEMPCAO) de volta ao orquestrador
+    5. Suporta shutdown gracioso via mensagem "STOP"
+    
+    Args:
+        server_id (int): Identificador único deste servidor.
+        port (int): Porta TCP para escutar (tipicamente 5000 + server_id).
+        quantum (float): Limite de tempo por fatia de execução (0 = sem limite).
+                        
+    Lifecycle:
+        1. Cria socket TCP em modo SO_REUSEADDR (permite restart rápido)
+        2. Entra em loop accept() para aguardar conexões
+        3. Para cada conexão: spawn thread por tarefa recebida
+        4. Ao receber "STOP", encerra loops e fecha socket
+        
+    Concurrency:
+        - Uma thread por tarefa ativa (paralelismo real limitado por GIL+I/O)
+        - Lock por conexão protege envios no socket compartilhado
+        - Threads são daemon=True (encerram com processo pai)
+        
+    Protocol:
+        - Input: JSON por linha (ex: {"id": 101, "tempo_exec": 5, ...})
+        - Output: JSON por linha (ex: {"tipo": "CONCLUSAO", "req_id": 101, ...})
+        - Control: String "STOP" encerra servidor
+        
+    Note:
+        - Roda como processo separado (multiprocessing) para isolamento real.
+        - SO_REUSEADDR evita erro "Address already in use" em restarts rápidos.
+        - Backlog de 5 conexões pendentes suficiente para 1 cliente.
+    """
+    # Cria socket TCP IPv4
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    
+    # Permite reusar porta imediatamente após encerramento (evita TIME_WAIT)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    
+    # Tenta ligar socket à porta especificada
+    try:
+        server_socket.bind(('0.0.0.0', port))
+        # Habilita modo listening com backlog=5 (até 5 conexões pendentes)
+        server_socket.listen(5)
+    except Exception as e:
+        # Falha crítica: porta ocupada ou sem permissões
+        print(f"[Server {server_id}] Erro ao ligar na porta {port}: {e}")
+        return
+
+    # Loop principal: aguarda conexões indefinidamente
+    while True:
+        try:
+            # Aceita próxima conexão (bloqueia até cliente conectar)
+            conn, addr = server_socket.accept()
+            
+            # Lock exclusivo para esta conexão (protege send_json concorrente)
+            socket_lock = threading.Lock()
+            
+            # Loop de recepção: processa mensagens até STOP ou desconexão
+            while True:
+                # Lê próxima mensagem JSON (bloqueia até receber linha completa)
+                requisicao = recv_json(conn)
+                
+                # Verifica condições de término
+                if not requisicao:           # Conexão fechada ou erro de leitura
+                    break
+                if requisicao == "STOP":     # Comando de shutdown
+                    break
+
+                # Mensagem normal: trata como tarefa a processar
+                # ARQUITETURA PARALELA: Uma thread por tarefa
+                # Permite múltiplas tarefas simultâneas no mesmo servidor
+                t = threading.Thread(
+                    target=process_task_thread,
+                    args=(conn, socket_lock, requisicao, quantum, server_id),
+                    daemon=True  # Thread morre com processo pai
+                )
+                t.start()
+            
+            # Cleanup: fecha conexão após loop interno
+            conn.close()
+            
+            # Se recebeu STOP, encerra servidor completamente
+            if requisicao == "STOP":
+                break
+
+        except Exception as e:
+            # Erro de comunicação: loga silenciosamente e aguarda próxima conexão
+            # Comentado para evitar poluir stdout com erros esperados (ex: RST)
+            # print(f"Erro na conexão do server {server_id}: {e}")
+            pass
+            
+    # Cleanup final: fecha socket de escuta ao sair do loop
+    server_socket.close()

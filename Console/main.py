@@ -258,3 +258,152 @@ class RealtimeLogger:
                 # Contadores: incrementa acumulador
                 elif isinstance(self.metrics[metric_name], (int, float)):
                     self.metrics[metric_name] += value
+
+# ============================================================================
+# 4. ALGORITMO QUICK FIT (ADAPTADO PARA CARGA ATIVA)
+# ============================================================================
+
+class QuickFitAllocator:
+    """Alocador Quick Fit adaptado para balanceamento dinâmico de carga.
+
+    Implementa uma variação do algoritmo Quick Fit clássico de alocação de
+    memória, adaptado para distribuição de tarefas entre servidores com
+    capacidades heterogêneas e cargas variáveis em tempo real.
+    
+    Algoritmo de Seleção (Least Connections com Desempates):
+        1. Filtra servidores disponíveis (carga < capacidade).
+        2. Ordena por critérios:
+            a) Menor carga ativa (minimiza congestionamento).
+            b) Maior capacidade (desempate, favorece servidores potentes).
+            c) Menor ID (desempate determinístico).
+        3. Retorna o servidor ideal ou None se todos saturados.
+        
+    Diferenças do Quick Fit Tradicional:
+        - Original: alocação de blocos de memória de tamanhos fixos.
+        - Adaptado: distribuição de tarefas considerando capacidade dinâmica.
+        
+    Attributes:
+        servidores (list): Lista de dicionários com metadados dos servidores.
+                          Cada item deve conter 'id' e 'capacidade'.
+    """
+
+    def __init__(self, servidores):
+        """Inicializa alocador com configuração de servidores.
+        
+        Args:
+            servidores (list): Lista de servidores com schema:
+                [{"id": int, "capacidade": int}, ...]
+        """
+        # Armazena referência imutável à configuração de servidores
+        self.servidores = servidores
+
+    def calcular_estado_servidores(self, task_queues, current_loads):
+        """Gera snapshot consistente do estado de todos os servidores.
+
+        Combina dados de configuração estática (capacidade) com métricas
+        dinâmicas (carga ativa) para determinar disponibilidade em tempo real.
+        
+        Args:
+            task_queues (dict): Mapa {server_id: Queue} com filas de tarefas pendentes.
+            current_loads (dict): Mapa {server_id: int} com contadores de tarefas
+                                 em execução no momento (snapshot thread-safe).
+                                 
+        Returns:
+            dict: Mapa {server_id: estado} onde cada estado contém:
+                - 'id' (int): Identificador do servidor.
+                - 'capacidade' (int): Máximo de tarefas paralelas suportadas.
+                - 'carga_atual' (int): Tarefas atualmente em execução.
+                - 'pode_aceitar' (bool): True se carga < capacidade.
+                
+        Note:
+            - Usa `current_loads` (contador controlado) ao invés de `qsize()`
+              (apenas tarefas enfileiradas) para refletir carga real.
+            - Snapshot é instantâneo mas pode desatualizar; lock externo
+              garante consistência se necessário.
+        """
+        estado = {}
+        for server_id, queue_obj in task_queues.items():
+            # Obtém capacidade teórica da configuração
+            capacidade = self._get_capacidade(server_id)
+            
+            # Carga real: tarefas em execução (não apenas na fila)
+            # Fonte confiável: contador mantido pelo Scheduler com locks
+            carga_ativa = current_loads.get(server_id, 0)
+            
+            estado[server_id] = {
+                'id': server_id,
+                'capacidade': capacidade,
+                'carga_atual': carga_ativa,
+                # Só aceita se carga ativa for menor que capacidade
+                'pode_aceitar': carga_ativa < capacidade
+            }
+        return estado
+
+    def _get_capacidade(self, server_id):
+        """Consulta capacidade configurada de um servidor pelo ID.
+        
+        Args:
+            server_id (int): Identificador do servidor.
+            
+        Returns:
+            int: Capacidade (número máximo de tarefas paralelas) ou 1 se
+                 servidor não encontrado (fallback seguro).
+                 
+        Complexity:
+            O(n) onde n = número de servidores. Aceitável para clusters pequenos.
+            Para escala maior, considerar dicionário indexado por ID.
+        """
+        for srv in self.servidores:
+            if srv["id"] == server_id:
+                return srv["capacidade"]
+        # Fallback: assume capacidade unitária se servidor não encontrado
+        return 1
+
+    def encontrar_melhor_servidor(self, requisicao, estado_servidores):
+        """Seleciona servidor ideal usando heurística Least Connections.
+
+        Algoritmo de seleção otimizado para minimizar congestionamento e
+        aproveitar servidores de maior capacidade. Critérios aplicados
+        sequencialmente para desempate determinístico.
+        
+        Args:
+            requisicao (dict): Metadados da tarefa a ser alocada (não usado
+                              na versão atual, reservado para extensões).
+            estado_servidores (dict): Snapshot de estados retornado por
+                                     calcular_estado_servidores().
+                                     
+        Returns:
+            int: ID do servidor selecionado, ou
+            None: Se todos os servidores estão saturados (carga ≥ capacidade).
+            
+        Critérios de Seleção (em ordem de prioridade):
+            1. **Menor carga atual**: Distribui uniformemente, evita hot spots.
+            2. **Maior capacidade**: Em caso de empate, favorece servidores
+               mais potentes (mais espaço para crescimento).
+            3. **Menor ID**: Desempate final determinístico para reprodutibilidade.
+            
+        Complexity:
+            O(n) onde n = número de servidores disponíveis.
+            
+        Note:
+            Parâmetro `requisicao` permite extensões futuras com seleção
+            baseada em características da tarefa (ex: tipo, prioridade).
+        """
+        # Fase 1: Filtra servidores que têm capacidade disponível
+        candidatos = [e for e in estado_servidores.values() if e['pode_aceitar']]
+        
+        # Se todos saturados, sinaliza impossibilidade de alocar
+        if not candidatos:
+            return None
+
+        # Fase 2: Aplica critérios de seleção com tupla ordenada
+        # Python compara tuplas lexicograficamente (elemento por elemento)
+        melhor = min(
+            candidatos,
+            key=lambda est: (
+                est['carga_atual'],      # 1º: menor carga (menos congestionado)
+                -est['capacidade'],      # 2º: maior capacidade (nega para ordem decrescente)
+                est['id']                # 3º: menor ID (desempate determinístico)
+            )
+        )
+        return melhor['id']

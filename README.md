@@ -8,8 +8,6 @@ Projeto completo de orquestração distribuída com duas interfaces sobre o mesm
 ## Imagem da Arquitetura
 ![paraalelismo arquitetura](diagrama_arquitetura_paralelismo.png)
 
-Perfeito! Vou te ajudar a organizar o trecho do README com instruções claras para preparar o ambiente, diferenciando os comandos para **Windows** e **Linux/Mac**. Aqui está um exemplo bem estruturado:  
-
 ---
 
 ## Guia de Preparação do Ambiente

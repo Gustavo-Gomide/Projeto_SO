@@ -1,0 +1,35 @@
+<!--
+Base template da UI Flask.
+
+Responsável por definir a estrutura comum da página:
+- Head com meta responsivo e link para CSS.
+- Header com título.
+- Main com bloco Jinja (nome "content") para conteúdo das páginas.
+- Footer com rodapé simples.
+
+Observação: Comentários não incluem sintaxe Jinja para evitar parsing.
+O arquivo index.html estende este template via Jinja2.
+-->
+<!doctype html>
+<html lang="pt-br">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>BSB Compute – Orquestrador Distribuído</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <!-- Cabeçalho global -->
+  <header>
+    <h1>BSB Compute – Orquestrador Distribuído</h1>
+  </header>
+  <!-- Área principal: conteúdo específico de cada página -->
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+  <!-- Rodapé minimalista -->
+  <footer>
+    <small>© Projeto acadêmico – Flask UI</small>
+  </footer>
+</body>
+</html>

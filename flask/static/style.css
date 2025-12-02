@@ -1,0 +1,141 @@
+/*
+=================================================================
+BSB COMPUTE — Estilos da UI (Tema Escuro + Responsivo)
+=================================================================
+
+Visão geral:
+- A UI privilegia legibilidade em ambientes escuros e densos de dados.
+- Grids responsivos distribuem conteúdo sem exigir regras por dispositivo.
+- Cores comunicam estado (atribuição, conclusão, preempção, erro, fim).
+
+Seções:
+- Layout base: tipografia, cores, espaçamentos e estrutura geral.
+- Form de controle: grid responsivo que organiza inputs e botões.
+- Status e métricas: cartões com contraste para leitura rápida.
+- Servidores: cards com barra de uso e chips para fila/ativos.
+- Logs: painel monoespaçado com sintaxe por tipo de evento.
+- Tooltips: dicas CSS-only para explicar elementos sem JS extra.
+*/
+
+/* Layout base
+	 - `box-sizing:border-box`: inclui padding/borda no cálculo total de largura/altura.
+		 Isso evita que componentes "estourem" o grid ao adicionar espaçamentos.
+	 - `background` escuro (#0a1022): favorece leituras prolongadas e destaca cores de estado.
+	 - `color` (#e6edf3): alto contraste em monitores variados; mantém acessibilidade.
+	 - `header`/`footer` com `border-bottom`: separação estrutural sem criar sombras ou elevações.
+	 - `main` com `padding`: mantém respirabilidade do conteúdo; reduz agrupamento visual. */
+*{box-sizing:border-box}
+body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:0;background:#0a1022;color:#e6edf3}
+header,footer{background:#0d1228;padding:12px 20px;border-bottom:1px solid #1c2547}
+h1{margin:0;font-size:20px}
+main{padding:20px}
+section{margin-bottom:18px}
+
+/* Formulário de controle
+	- `display:grid`: distribui campos em colunas flexíveis, ideal para formulários variáveis.
+	- `grid-template-columns:repeat(4,minmax(160px,1fr))`: garante colunas mínimas de 160px
+	  e expansão proporcional; evita campos espremidos.
+	- `gap:10px`: separa elementos sem margem individual; simplifica manutenção.
+	- `align-items:end`: alinha inputs e botões pela base, criando alinhamento visual entre linhas. */
+.controls form{display:grid;grid-template-columns:repeat(4,minmax(160px,1fr));gap:10px;align-items:end}
+/* `label` em `flex` coluna: título acima, campo abaixo, reforça associação sem precisar de wrappers extras. */
+label{display:flex;flex-direction:column;font-size:12px;color:#bcd0ea}
+/* Campos com `border-radius:6px` suavizam cantos, melhorando touch targets.
+	Bordas e fundo escuro indicam foco e hierarquia sem usar box-shadows. */
+input,select,button{padding:8px;border-radius:6px;border:1px solid #2a3a6b;background:#0b142f;color:#e6edf3}
+/* `button` com `cursor:pointer` reforça affordance; `hover` muda apenas o fundo
+	para não gerar fadiga com mudanças agressivas de borda/tipografia. */
+button{cursor:pointer;border:1px solid #30407a;background:#1a2551}
+button:hover{background:#2a3a6b}
+
+/* Status e métricas
+	- `status` como grid 1:2: dá mais espaço para métricas numéricas ao lado do resumo.
+	- Escolha por `grid` (não `flex`) permite colunas com larguras fixas/relativas
+	  e melhor controle de alinhamento em múltiplas linhas. */
+.status{display:grid;grid-template-columns:1fr 2fr;gap:16px}
+/* `metrics` em grid 3 colunas: agrupa KPIs em bloco visual estável.
+	Fundo/borda/raio criam "cartão" com foco de leitura. */
+.metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;background:#0b142f;border:1px solid #2a3a6b;border-radius:8px;padding:10px}
+/* Cada métrica é um bloco isolado: contraste leve para separar sem poluir. */
+.metrics div{background:#0c1738;padding:8px;border-radius:6px;border:1px solid #1f2a44}
+
+/* Grid de servidores
+	 - Por que `grid` aqui? Distribuição responsiva de cards com quebras naturais,
+		 sem precisar de cálculos de largura por item (como em flex com wrap).
+	 - `auto-fit` + `minmax(280px,1fr)`: garante legibilidade mínima do card,
+		 enquanto preenche a linha disponível de forma elegante.
+	 - Card (`.srv-card`) com borda/fundo: caixa com contexto, sem efeito de elevação.
+	 - Header `flex`: alinha título e badge em extremos, criando hierarquia visual.
+	 - Barra de uso: `border-radius:999px` dá aparência de "pílula" moderna.
+		 `overflow:hidden` garante que o preenchimento não ultrapasse os limites.
+	 - `linear-gradient` na `fill`: comunica intensidade de uso, facilita leitura periférica. */
+.servers{margin-top:10px}
+.servers-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:10px}
+.srv-card{background:#0b142f;border:1px solid #2a3a6b;border-radius:8px;padding:10px}
+/* `display:flex` no header: alinhamento horizontal natural entre título e indicadores.
+	 `justify-content:space-between`: separa ao máximo, reforçando leitura dos dois polos.
+	 `align-items:center`: mantém baseline consistente entre elementos de alturas distintas. */
+.srv-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}
+.badge{background:#1e2a57;border:1px solid #2f3e7a;border-radius:6px;padding:4px 8px}
+.use{color:#bcd0ea;font-size:12px}
+.bar{width:100%;height:12px;background:#0a1022;border:1px solid #2a3a6b;border-radius:999px;overflow:hidden}
+.bar .fill{height:100%;background:linear-gradient(90deg,#2dd4bf,#60a5fa);width:0%}
+.srv-foot{margin-top:6px;font-size:12px}
+.muted{color:#9fb4d6}
+
+/* Logs e legenda
+	 - Por que `font-family` monoespaçada? Números e timestamps se alinham verticalmente,
+		 agilizando inspeção e comparação de tempos.
+	 - `height` fixa com `overflow:auto`: evita que logs empurrem outros conteúdos;
+		 mantém layout previsível.
+	 - Cores por tipo: mapeamento semântico (atribuição/azul, conclusão/verde,
+		 preempção/rosa, erro/vermelho, fim/amarelo) facilita triagem visual. */
+.log{height:380px;overflow:auto;background:#091027;border:1px solid #2a3a6b;border-radius:8px;padding:12px;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace}
+.line{padding:2px 0;border-bottom:1px dotted rgba(255,255,255,.06)}
+.type-ATRIBUICAO{color:#7dd3fc}
+.type-CONCLUSAO{color:#86efac}
+.type-PREEMPCAO{color:#f0abfc}
+.type-INFO{color:#cbd5e1}
+.type-ERRO{color:#fca5a5}
+.type-FIM{color:#fde68a;font-weight:600}
+.legend{margin-top:6px}
+
+/* Chips (IDs em execução ou fila)
+	 - Por que `display:inline-block`? Permite múltiplos chips fluírem na mesma linha
+		 com controle de padding e largura, sem ocupar a linha inteira.
+	 - Pílula (`border-radius:999px`): affordance de tag; melhora legibilidade em listas densas.
+	 - Paleta por estado: apoio cognitivo rápido ao operador sem leitura detalhada. */
+.chip{display:inline-block;background:#0f1a3a;border:1px solid #2a3a6b;color:#e6edf3;padding:2px 6px;border-radius:999px;font-size:12px;margin-right:4px}
+.chip.running{background:#103a2c;border-color:#1f6f54}
+.chip.a{background:#0b2840}
+.chip.c{background:#0b4020}
+.chip.p{background:#3a0b40}
+
+/* Tooltips CSS-only
+	 - Por que `position:relative` no trigger? Estabelece contexto de posicionamento
+		 para o pseudo-elemento sem afetar fluxo do documento.
+	 - `::after` com `bottom:120%`: posiciona a dica acima do elemento, com folga
+		 para não colidir; `transform` anima a entrada de forma discreta.
+	 - `pointer-events:none`: evita que o tooltip intercepte cliques/hover, mantendo
+		 a experiência fluida. */
+.tip{position:relative;border-bottom:1px dotted #7dd3fc;cursor:help}
+.tip::after{content:attr(data-tip);position:absolute;left:0;bottom:120%;opacity:0;pointer-events:none;background:#0d1228;border:1px solid #2a3a6b;color:#e6edf3;padding:6px 8px;border-radius:6px;white-space:nowrap;transform:translateY(6px);transition:opacity .15s, transform .15s;font-size:12px}
+.tip:hover::after{opacity:1;transform:translateY(0)}
+
+/* Responsividade
+	 - Por que estes breakpoints? 900px cobre tablets em landscape e notebooks compactos;
+		 600px cobre smartphones comuns em portrait.
+	 - Estratégia: reduzir colunas para preservar largura mínima dos cards/campos,
+		 mantendo leitura sem zoom/scroll horizontal. */
+@media (max-width: 900px){
+	.controls form{grid-template-columns:repeat(2,minmax(160px,1fr))}
+	.status{grid-template-columns:1fr}
+	.metrics{grid-template-columns:repeat(2,1fr)}
+}
+
+@media (max-width: 600px){
+	.controls form{grid-template-columns:1fr}
+	.metrics{grid-template-columns:1fr}
+	.servers-grid{grid-template-columns:1fr}
+	.log{height:300px} /* reduz altura do log para caber em viewport menor */
+}

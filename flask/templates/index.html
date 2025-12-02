@@ -1,0 +1,231 @@
+{% extends 'base.html' %}
+{% block content %}
+<!--
+UI principal: controla execução, exibe status/servidores e logs em tempo real.
+
+Estrutura:
+- Controls: formulário para iniciar/parar com estratégia, quantum e caminho do tasks.json.
+- Status: métricas agregadas (concluídas, pendentes, preempções, tempos, CPU/mem).
+- Servers: cards dinâmicos por servidor com uso, barra, ativos e fila (chips).
+- Logs: stream SSE renderizado com cores por tipo (atribuição/conclusão/preempção/info/erro).
+
+JS:
+- refreshMetrics(): consulta /metrics e atualiza valores.
+- renderServers(): reconstrói/atualiza grid responsiva com dados de /status.
+- setStatus(): atualiza status geral e pendentes.
+- openEvents(): abre EventSource para /events e envia linhas ao log.
+- Handlers do formulário: POST /start (limpa logs), POST /stop.
+
+Observação: grid usa auto-fit no CSS para se adaptar a N servidores.
+Observação: chips de `active_ids` (running) e `queue_ids` (em fila) melhoram visibilidade.
+-->
+<section class="controls">
+  <form id="formStart">
+    <label>Estratégia
+      <select name="strategy" id="strategy">
+        <option value="SJF">SJF</option>
+        <option value="ROUND_ROBIN" selected>ROUND_ROBIN</option>
+        <option value="PRIORIDADE">PRIORIDADE</option>
+        <option value="FIFO">FIFO</option>
+      </select>
+    </label>
+    <label>Quantum (s)
+      <input type="number" name="quantum" id="quantum" min="0" value="2" />
+    </label>
+    <label>tasks.json (opcional)
+      <input type="text" name="tasksPath" id="tasksPath" placeholder="caminho absoluto ou deixe em branco" />
+    </label>
+    <button type="submit">Iniciar</button>
+    <button type="button" id="btnStop">Parar</button>
+  </form>
+</section>
+
+<section class="status">
+  <div>
+    <strong>Status:</strong> <span id="lblStatus">parado</span>
+  </div>
+  <div class="metrics" id="metrics">
+    <div><strong><span class="tip" data-tip="Quantidade de tarefas finalizadas / total configurado">Concluídas</span></strong>: <span id="mTotal">0</span>/<span id="mTotalReq">0</span></div>
+    <div><strong><span class="tip" data-tip="Tarefas aguardando + em execução">Pendentes</span></strong>: <span id="mPend">0</span></div>
+    <div><strong><span class="tip" data-tip="Interrupções por quantum durante a execução">Preempções</span></strong>: <span id="mPre">0</span></div>
+    <div><strong><span class="tip" data-tip="Tempo total desde o início até o fim da execução">Tempo Total</span></strong>: <span id="mTempo">0</span>s</div>
+    <div><strong><span class="tip" data-tip="Tempo médio para cada requisição completar">Média Resposta</span></strong>: <span id="mMedia">0</span>s</div>
+    <div><strong><span class="tip" data-tip="Taxa de processamento (req/s)">Throughput</span></strong>: <span id="mTh">0</span> req/s</div>
+    <div><strong><span class="tip" data-tip="CPU média do sistema durante a execução">CPU Média</span></strong>: <span id="mCpu">0</span>%</div>
+    <div><strong><span class="tip" data-tip="Uso médio de memória do sistema (percentual)">Memória Sist. (média)</span></strong>: <span id="mMemSys">0</span>%</div>
+    <div><strong><span class="tip" data-tip="Memória média/peak do processo (Flask + servidores)">Memória Proc.</span></strong>: <span id="mMemProc">0</span> MB (pico: <span id="mMemPeak">0</span> MB)</div>
+  </div>
+</section>
+
+<section class="servers">
+  <h2>Servidores</h2>
+  <div id="servers" class="servers-grid"></div>
+  <small id="srvHint" class="muted"></small>
+</section>
+
+<section class="logs">
+  <h2>Logs</h2>
+  <div id="log" class="log mono"></div>
+  <div class="legend muted">Legenda: <span class="chip a">Atribuição</span> <span class="chip c">Conclusão</span> <span class="chip p">Preempção</span> <span class="chip i">Info</span> <span class="chip e">Erro</span></div>
+</section>
+
+<script>
+// =============================
+// LÓGICA DA UI (Cliente)
+// =============================
+const logEl = document.getElementById('log');
+const lblStatus = document.getElementById('lblStatus');
+const form = document.getElementById('formStart');
+const btnStop = document.getElementById('btnStop');
+let evtSrc = null;
+
+// Adiciona nova linha ao painel de logs
+function appendLog(text, type){
+  const line = document.createElement('div');
+  const t = (type||'INFO').toUpperCase();
+  line.className = 'line type-' + t;
+  line.textContent = text;
+  logEl.appendChild(line);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+// Atualiza métricas agregadas a partir da API /metrics
+function refreshMetrics(){
+  fetch('/metrics').then(r=>r.json()).then(m=>{
+    if(!m) return;
+    document.getElementById('mTotal').textContent = m.total_concluidas ?? 0;
+    document.getElementById('mTotalReq').textContent = m.total_requisicoes ?? 0;
+    // pendentes preferimos do /status; mas se não, calculamos
+    document.getElementById('mPre').textContent = m.preempcoes ?? 0;
+    document.getElementById('mTempo').textContent = m.tempo_total ?? 0;
+    document.getElementById('mMedia').textContent = m.media_resposta ?? 0;
+    document.getElementById('mTh').textContent = m.throughput ?? 0;
+    document.getElementById('mCpu').textContent = m.cpu_avg ?? 0;
+    document.getElementById('mMemSys').textContent = m.mem_sys_percent_avg ?? 0;
+    document.getElementById('mMemProc').textContent = m.mem_proc_mb_avg ?? 0;
+    document.getElementById('mMemPeak').textContent = m.mem_proc_mb_peak ?? 0;
+  });
+}
+
+// Renderiza e atualiza grid de servidores dinamicamente
+function renderServers(servers){
+  const wrap = document.getElementById('servers');
+  if(!Array.isArray(servers)) return;
+  
+  // Detecta mudanças na lista de servidores (IDs diferentes)
+  const currentIds = Array.from(wrap.querySelectorAll('.srv-card')).map(c => c.id.replace('srv-', ''));
+  const newIds = servers.map(s => String(s.id));
+  const needsRebuild = currentIds.length !== newIds.length || 
+                       currentIds.some((id, i) => id !== newIds[i]);
+  
+  // Reconstrói se mudou ou está vazio
+  if(!wrap.dataset.init || needsRebuild){
+    wrap.innerHTML = '';
+    servers.forEach(s => {
+      const card = document.createElement('div');
+      card.className = 'srv-card';
+      card.id = 'srv-' + s.id;
+      card.innerHTML = `
+        <div class="srv-header">
+          <span class="badge">SRV ${s.id}</span>
+          <span class="use">Uso: <b id="use-${s.id}">0</b> / ${s.capacidade} Tarefas</span>
+        </div>
+        <div class="bar"><div class="fill" id="bar-${s.id}" style="width:0%"></div></div>
+        <div class="srv-foot muted">
+          <div>Executando: <span id="active-${s.id}" class="chips"></span></div>
+          <div>Fila: <span id="queue-${s.id}" class="chips"></span> <span class="muted" id="qsize-${s.id}"></span></div>
+        </div>
+      `;
+      wrap.appendChild(card);
+    });
+    wrap.dataset.init = '1';
+  }
+  // Atualiza valores renderizados
+  servers.forEach(s => {
+    const pct = Math.min(100, Math.round((s.carga / Math.max(1, s.capacidade)) * 100));
+    const use = document.getElementById('use-' + s.id);
+    const bar = document.getElementById('bar-' + s.id);
+    const ql = document.getElementById('queue-' + s.id);
+    const qsz = document.getElementById('qsize-' + s.id);
+    const act = document.getElementById('active-' + s.id);
+    if(use) use.textContent = s.carga;
+    if(bar) bar.style.width = pct + '%';
+    if(ql){
+      ql.innerHTML = '';
+      (s.queue_ids||[]).forEach(id=>{
+        const chip = document.createElement('span');
+        chip.className = 'chip';
+        chip.textContent = '(' + id + ')';
+        ql.appendChild(chip);
+      });
+    }
+    if(qsz) qsz.textContent = s.fila && s.queue_ids && s.fila> s.queue_ids.length ? `+${s.fila - s.queue_ids.length}` : '';
+    if(act){
+      act.innerHTML = '';
+      (s.active_ids||[]).forEach(id=>{
+        const chip = document.createElement('span');
+        chip.className = 'chip running';
+        chip.textContent = '(' + id + ')';
+        act.appendChild(chip);
+      });
+    }
+  });
+}
+
+// Atualiza status geral e pendentes
+function setStatus(){
+  fetch('/status').then(r=>r.json()).then(s=>{
+    lblStatus.textContent = s.running ? 'executando' : 'parado';
+    if(Array.isArray(s.servers)){
+      renderServers(s.servers);
+    }
+    if(typeof s.pendentes === 'number'){
+      const el = document.getElementById('mPend');
+      if(el) el.textContent = s.pendentes;
+    }
+  });
+}
+
+// Abre stream SSE para capturar eventos de execução em tempo real
+function openEvents(){
+  if(evtSrc){ evtSrc.close(); }
+  evtSrc = new EventSource('/events');
+  evtSrc.onmessage = (e)=>{
+    try {
+      const obj = JSON.parse(e.data);
+      if(obj && obj.text){ appendLog(obj.text, obj.type); }
+      if(obj && obj.type === 'FIM'){ setStatus(); }
+    } catch(err){ /* ignore */ }
+  };
+}
+
+// Inicia execução via POST /start e prepara UI (limpa log, abre SSE)
+form.addEventListener('submit', async (ev)=>{
+  ev.preventDefault();
+  // limpar logs ao iniciar nova execução
+  logEl.innerHTML = '';
+  const fd = new FormData(form);
+  const payload = Object.fromEntries(fd.entries());
+  const res = await fetch('/start', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+  const j = await res.json();
+  appendLog('[UI] ' + j.message);
+  setStatus();
+  openEvents();
+  setTimeout(refreshMetrics, 500);
+});
+
+// Solicita parada via POST /stop
+btnStop.addEventListener('click', async ()=>{
+  const res = await fetch('/stop', {method:'POST'});
+  const j = await res.json();
+  appendLog('[UI] ' + j.message);
+  setStatus();
+  setTimeout(refreshMetrics, 500);
+});
+
+// Inicialização da UI: consulta status/métricas e atualiza a cada 800ms
+setStatus();
+refreshMetrics();
+setInterval(()=>{ setStatus(); refreshMetrics(); }, 800);
+</script>
+{% endblock content %}
